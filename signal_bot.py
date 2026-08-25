@@ -98,4 +98,12 @@ for sym in SYMBOLS:
         state["last_alerted_candle"][sym]=iso
     except: continue
 save_state(state)
-print("Done")
+print("Done")# TEST MESSAGE
+import os, requests
+token = os.getenv("TELEGRAM_TOKEN")
+chat_id = os.getenv("TELEGRAM_CHAT_ID")
+if token and chat_id:
+    try:
+        requests.post(f"https://api.telegram.org/bot{token}/sendMessage", data={"chat_id": chat_id, "text": "✅ SMC Bot 24-5 is LIVE! Checking 6 pairs every 15min. No setup yet - will alert when found."})
+    except Exception as e:
+        print(e)
