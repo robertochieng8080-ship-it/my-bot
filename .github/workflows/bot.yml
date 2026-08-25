@@ -1,0 +1,26 @@
+name: SMC Bot 24-5 - 6 Pairs
+on:
+  schedule:
+    - cron: '*/15 * * * 1-5'
+  workflow_dispatch:
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install requests pandas numpy
+      - name: Run bot
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python signal_bot.py
+      - name: Save state
+        run: |
+          git config user.name "bot"
+          git config user.email "bot@bot.com"
+          git add bot_state.json signal_log.csv || true
+          git diff --staged --quiet || git commit -m "update state"
+          git push || true
