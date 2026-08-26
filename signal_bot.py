@@ -1,103 +1,166 @@
-import os, requests, pandas as pd, yfinance as yf
-from datetime import datetime
+import yfinance as yf
+import pandas as pd
+import requests, os, json
+from datetime import datetime, timedelta
 
-TOKEN = os.getenv("TELEGRAM_TOKEN")
+PAIRS = {"EURUSD": "EURUSD=X", "GBPUSD": "GBPUSD=X", "GOLD": "GC=F", "AUDUSD": "AUDUSD=X"}
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+SENT_FILE = "last_signals.json"
 
-PAIRS = ["EURUSD=X", "GBPUSD=X", "USDJPY=X", "GC=F", "GBPJPY=X", "AUDUSD=X"]
-NAMES = ["EURUSD", "GBPUSD", "USDJPY", "GOLD", "GBPJPY", "AUDUSD"]
-
-def send_telegram(msg):
+def send(msg):
     try:
-        url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-        requests.post(url, data={"chat_id": CHAT_ID, "text": msg, "parse_mode": "Markdown"}, timeout=10)
+        requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+        data={"chat_id": CHAT_ID, "text": msg, "parse_mode": "Markdown"}, timeout=10)
     except: pass
 
-def is_news_time():
-    now = datetime.utcnow()
-    mins = now.hour*60 + now.minute
-    # High impact news blackout UTC - 8:30am EST = 12:30 UTC, 10am EST=14:00 UTC, 2pm EST=18:00 UTC
-    blackout = [
-        (12*60+25, 13*60+15), # US 8:30 news (CPI,NFP,PPI)
-        (14*60+0, 14*60+45), # US 10:00 news
-        (18*60+0, 19*60+0), # FOMC
-        (7*60+55, 8*60+30), # EU open high volatility
-    ]
-    for s,e in blackout:
-        if s <= mins <= e:
-            print(f"News blackout {now.strftime('%H:%M UTC')} - skipping")
-            return True
-    return False
+def load_sent():
+    if os.path.exists(SENT_FILE):
+        try: return json.load(open(SENT_FILE))
+        except: return {}
+    return {}
 
-def get_levels(df, bullish):
-    recent = df.tail(30)
-    ob = None
-    if bullish:
-        for i in range(len(recent)-5, 5, -1):
-            if recent['Close'].iloc[i] < recent['Open'].iloc[i]:
-                ob = recent.iloc[i]; break
-    else:
-        for i in range(len(recent)-5, 5, -1):
-            if recent['Close'].iloc[i] > recent['Open'].iloc[i]:
-                ob = recent.iloc[i]; break
-    if ob is None: ob = recent.iloc[-10]
-    entry = (float(ob['High'])+float(ob['Low']))/2
-    atr = float((recent['High']-recent['Low']).mean())
-    if bullish:
-        sl = float(ob['Low']) - atr*0.2
-        if entry-sl < atr*0.3: sl = entry - atr*0.8
-        risk = entry-sl
-        tp1 = entry + risk*3.0
-        tp2 = entry + risk*5.0
-    else:
-        sl = float(ob['High']) + atr*0.2
-        if sl-entry < atr*0.3: sl = entry + atr*0.8
-        risk = sl-entry
-        tp1 = entry - risk*3.0
-        tp2 = entry - risk*5.0
-    return entry, sl, tp1, tp2
+def can_send(pair, sent):
+    # Don't spam same pair within 2 hours
+    if pair in sent:
+        last = datetime.fromisoformat(sent[pair])
+        if datetime.utcnow() - last < timedelta(hours=2):
+            return False
+    return True
 
-def check_pair(pair, name):
-    try:
-        # 15M for entry
-        df = yf.download(pair, period="5d", interval="15m", progress=False)
-        if len(df) < 50: return None
-        if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
+def check_fvg(df):
+    # Bullish FVG: Low[2] > High[0]
+    for i in range(len(df)-5, len(df)-2):
+        if df['Low'].iloc[i+2] > df['High'].iloc[i]:
+            return {"type": "BULL_FVG", "zone_low": df['High'].iloc[i], "zone_high": df['Low'].iloc[i+2]}
+        if df['High'].iloc[i+2] < df['Low'].iloc[i]:
+            return {"type": "BEAR_FVG", "zone_low": df['High'].iloc[i+2], "zone_high": df['Low'].iloc[i]}
+    return None
 
-        # 1H for HTF filter
-        df1h = yf.download(pair, period="10d", interval="1h", progress=False)
-        if isinstance(df1h.columns, pd.MultiIndex): df1h.columns = df1h.columns.get_level_values(0)
-        ema50_1h = float(df1h['Close'].ewm(span=50).mean().iloc[-1])
-        close_1h = float(df1h['Close'].iloc[-1])
-        htf_bull = close_1h > ema50_1h
-        htf_bear = close_1h < ema50_1h
+def check_demand_supply(df):
+    atr = (df['High'] - df['Low']).rolling(14).mean().iloc[-1]
+    for i in range(len(df)-10, len(df)-3):
+        base = df.iloc[i-2:i+1]
+        imp = df.iloc[i+1]
+        base_range = base['High'].max() - base['Low'].min()
+        # Small base + big impulse = fresh zone
+        if base_range < atr * 0.8 and (imp['Close'] - imp['Open']) > atr:
+            if imp['Close'] > base['High'].max(): # Demand
+                return {"type": "DEMAND", "zone_low": base['Low'].min(), "zone_high": base['High'].max()}
+            if imp['Close'] < base['Low'].min(): # Supply
+                return {"type": "SUPPLY", "zone_low": base['Low'].min(), "zone_high": base['High'].max()}
+    return None
 
-        last_close = float(df['Close'].iloc[-1])
-        high_10 = float(df['High'].rolling(10).max().iloc[-2])
-        low_10 = float(df['Low'].rolling(10).min().iloc[-2])
-        ema24 = float(df['Close'].ewm(span=24).mean().iloc[-1])
-        ema5 = float(df['Close'].ewm(span=5).mean().iloc[-1])
+def check_liquidity_sweep(df):
+    recent_high = df['High'].tail(20).max()
+    recent_low = df['Low'].tail(20).min()
+    last = df.iloc[-2]
+    # Bullish sweep: wick below low then close above
+    if last['Low'] < recent_low and last['Close'] > recent_low:
+        return "BULL_SWEEP"
+    if last['High'] > recent_high and last['Close'] < recent_high:
+        return "BEAR_SWEEP"
+    return None
 
-        bullish_bos = last_close > high_10 and ema5 > ema24 and htf_bull
-        bearish_bos = last_close < low_10 and ema5 < ema24 and htf_bear
+def analyze_pair(name, ticker, sent):
+    df15 = yf.download(ticker, period="5d", interval="15m", progress=False, auto_adjust=True)
+    df1h = yf.download(ticker, period="10d", interval="1h", progress=False, auto_adjust=True)
+    if len(df15) < 60 or len(df1h) < 60: return
 
-        if is_news_time():
-            return None # Skip during news
+    df15['EMA24'] = df15['Close'].ewm(span=24).mean()
+    df15['EMA5'] = df15['Close'].ewm(span=5).mean()
+    df1h['EMA50'] = df1h['Close'].ewm(span=50).mean()
 
-        if bullish_bos:
-            entry, sl, tp1, tp2 = get_levels(df, True)
-            return f"🟢 *{name} BUY - SMC 24-5*\n\n*HTF 1H:* Above EMA50 ✅ {ema50_1h:.5f}\n*BOS:* {high_10:.5f} broken\n📍 *ENTRY:* `{entry:.5f}`\n🛑 *SL:* `{sl:.5f}`\n🎯 *TP1:* `{tp1:.5f}` (RR 1:3)\n🎯 *TP2:* `{tp2:.5f}` (RR 1:5)\n\n_Time: {datetime.utcnow().strftime('%H:%M UTC')}_"
+    last = df15.iloc[-2]
+    curr = df15.iloc[-1]
+    htf_bull = df1h['Close'].iloc[-1] > df1h['EMA50'].iloc[-1]
+    htf_bear = not htf_bull
 
-        if bearish_bos:
-            entry, sl, tp1, tp2 = get_levels(df, False)
-            return f"🔴 *{name} SELL - SMC 24-5*\n\n*HTF 1H:* Below EMA50 ✅ {ema50_1h:.5f}\n*BOS:* {low_10:.5f} broken\n📍 *ENTRY:* `{entry:.5f}`\n🛑 *SL:* `{sl:.5f}`\n🎯 *TP1:* `{tp1:.5f}` (RR 1:3)\n🎯 *TP2:* `{tp2:.5f}` (RR 1:5)\n\n_Time: {datetime.utcnow().strftime('%H:%M UTC')}_"
+    recent_high = df15['High'].tail(20).max()
+    recent_low = df15['Low'].tail(20).min()
 
-    except Exception as e:
-        print(f"{name} err {e}")
-        return None
+    bos_bull = last['Close'] > recent_high
+    bos_bear = last['Close'] < recent_low
 
-print("SMC 24-5 PRO + HTF + News Filter LIVE")
-for p,n in zip(PAIRS, NAMES):
-    s = check_pair(p,n)
-    if s: send_telegram(s)
-print("Done")
+    score = 0
+    reasons = []
+    entry_zone = None
+
+    # 1. HTF FILTER (Mandatory)
+    if not (htf_bull or htf_bear): return
+
+    # 2. SMC BOS + OB
+    if bos_bull and last['EMA5'] > last['EMA24']:
+        score += 1; reasons.append("SMC BOS")
+        entry_zone = last['Low']
+    if bos_bear and last['EMA5'] < last['EMA24']:
+        score += 1; reasons.append("SMC BOS")
+        entry_zone = last['High']
+
+    # 3. Demand/Supply
+    ds = check_demand_supply(df15)
+    if ds:
+        if ds['type'] == "DEMAND" and htf_bull:
+            score += 1; reasons.append("DEMAND")
+            entry_zone = (ds['zone_low'] + ds['zone_high'])/2
+        if ds['type'] == "SUPPLY" and htf_bear:
+            score += 1; reasons.append("SUPPLY")
+            entry_zone = (ds['zone_low'] + ds['zone_high'])/2
+
+    # 4. Pullback to EMA24
+    dist_to_ema = abs(last['Close'] - last['EMA24']) / last['Close'] * 100
+    if dist_to_ema < 0.15:
+        score += 1; reasons.append("PULLBACK 50%")
+
+    # 5. ICT FVG
+    fvg = check_fvg(df15)
+    if fvg:
+        if fvg['type'] == "BULL_FVG" and htf_bull:
+            score += 1; reasons.append("ICT FVG")
+            entry_zone = (fvg['zone_low'] + fvg['zone_high'])/2
+        if fvg['type'] == "BEAR_FVG" and htf_bear:
+            score += 1; reasons.append("ICT FVG")
+            entry_zone = (fvg['zone_low'] + fvg['zone_high'])/2
+
+    # 6. Liquidity Sweep
+    sweep = check_liquidity_sweep(df15)
+    if (sweep == "BULL_SWEEP" and htf_bull) or (sweep == "BEAR_SWEEP" and htf_bear):
+        score += 1; reasons.append("LIQUIDITY SWEEP")
+
+    # SEND ONLY IF CONFLUENCE >=3
+    if score >= 3 and can_send(name, sent) and entry_zone:
+        is_buy = htf_bull and ("DEMAND" in str(reasons) or bos_bull or (fvg and fvg['type']=="BULL_FVG"))
+        direction = "BUY" if is_buy else "SELL"
+        emoji = "🟢" if is_buy else "🔴"
+
+        # SL/TP calc
+        atr = (df15['High'] - df15['Low']).rolling(14).mean().iloc[-1]
+        if is_buy:
+            sl = entry_zone - atr * 0.5
+            tp1 = entry_zone + (entry_zone - sl) * 3
+            tp2 = entry_zone + (entry_zone - sl) * 5
+        else:
+            sl = entry_zone + atr * 0.5
+            tp1 = entry_zone - (sl - entry_zone) * 3
+            tp2 = entry_zone - (sl - entry_zone) * 5
+
+        grade = "A+" if score >=4 else "A" if score==3 else "B"
+
+        msg = f"{emoji} {name} {direction} - CONFLUENCE {score}/5 ({grade})\n"
+        msg += f"Types: {' + '.join(reasons)}\n"
+        msg += f"HTF 1H: {'Above' if htf_bull else 'Below'} EMA50 ✅\n"
+        msg += f"📍 ENTRY: {entry_zone:.5f}\n🛑 SL: {sl:.5f}\n"
+        msg += f"🎯 TP1: {tp1:.5f} (1:3)\n🎯 TP2: {tp2:.5f} (1:5)\n"
+        msg += f"Accuracy: {'HIGH' if score>=4 else 'MEDIUM'} - {score} strategies at same level\nTime: {datetime.utcnow().strftime('%H:%M UTC')}"
+
+        send(msg)
+        sent[name] = datetime.utcnow().isoformat()
+        json.dump(sent, open(SENT_FILE, 'w'))
+
+# Run
+sent = load_sent()
+for n, t in PAIRS.items():
+    try: analyze_pair(n, t, sent)
+    except Exception as e: print(f"{n} err {e}")
+
+print("PRO MAX scan done")
